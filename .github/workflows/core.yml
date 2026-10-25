@@ -1,115 +1,165 @@
-name: Core
+name: Build Irena 2.0.0
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ dev ]
-    tags: [ v* ]
-  pull_request:
-  merge_group:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build
-    runs-on: ubuntu-latest
-    env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
-      CCACHE_BASEDIR: "${{ github.workspace }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        continue-on-error: true
+      - name: Checkout Irena 2.0.0
+        uses: actions/checkout@v6
         with:
+          repository: re-zero001/LSPosed-Irena
+          ref: "2.0.0"
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Write key
-        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/dev' ) || github.ref_type == 'tag' }}
+      - name: Keep selected version tag
+        shell: bash
         run: |
-          if [ ! -z "${{ secrets.KEY_STORE }}" ]; then
-            echo androidStorePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> gradle.properties
-            echo androidKeyAlias='${{ secrets.ALIAS }}' >> gradle.properties
-            echo androidKeyPassword='${{ secrets.KEY_PASSWORD }}' >> gradle.properties
-            echo androidStoreFile='key.jks' >> gradle.properties
-            echo ${{ secrets.KEY_STORE }} | base64 --decode > key.jks
-          fi
+          set -euo pipefail
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+          # Only change tags in this temporary checkout.
+          # Keep JGit from selecting another release's version.
+          while IFS= read -r tag; do
+            if [ "$tag" != "2.0.0" ]; then
+              git tag -d "$tag"
+            fi
+          done < <(git tag --list)
+
+          git log -1 --format='%H %s'
+          git describe --tags --exact-match HEAD
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 21
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+          java-version: "21"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
-          log-accepted-android-sdk-licenses: 'false'
-          packages: ''
+          log-accepted-android-sdk-licenses: "false"
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;29.0.13599879
 
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-            max-size: 2G
-            key: ${{ runner.os }}
-            restore-keys: ${{ runner.os }}
-            save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@master
-        with:
-          version: 1.12.1
-
-      - name: Remove Android's cmake
+      - name: Setup CMake and Ninja
         shell: bash
-        run: rm -rf $ANDROID_HOME/cmake
-
-      - name: Configure Gradle properties
         run: |
-          echo 'org.gradle.caching=true' >> ~/.gradle/gradle.properties
-          echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
-          echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
-          echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
+          set -euo pipefail
 
-      - name: Build with Gradle
-        run: |
-          ./gradlew zipAll
+          python3 -m venv "$RUNNER_TEMP/irena-build-tools"
+          "$RUNNER_TEMP/irena-build-tools/bin/python" -m pip install \
+            "cmake==3.31.6" ninja
 
-      - name: Prepare artifact
-        if: success()
-        id: prepareArtifact
-        run: |
-          zygiskReleaseName=`ls magisk-loader/release/LSPosed-v*-Irena-release.zip | awk -F '(/|.zip)' '{print $3}'` && echo "zygiskReleaseName=$zygiskReleaseName" >> $GITHUB_OUTPUT
-          zygiskDebugName=`ls magisk-loader/release/LSPosed-v*-Irena-debug.zip | awk -F '(/|.zip)' '{print $3}'` && echo "zygiskDebugName=$zygiskDebugName" >> $GITHUB_OUTPUT
-          unzip magisk-loader/release/LSPosed-v*-Irena-release.zip -d LSPosed-Irena-release
-          unzip magisk-loader/release/LSPosed-v*-Irena-debug.zip -d LSPosed-Irena-debug
+          echo "$RUNNER_TEMP/irena-build-tools/bin" >> "$GITHUB_PATH"
 
-      - name: Upload zygisk release
-        uses: actions/upload-artifact@v4
+          if [ -d "$ANDROID_HOME/cmake" ]; then
+            rm -rf "$ANDROID_HOME/cmake"
+          fi
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
         with:
-          name: ${{ steps.prepareArtifact.outputs.zygiskReleaseName }}
-          path: "./LSPosed-Irena-release/*"
-
-      - name: Upload zygisk debug
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.prepareArtifact.outputs.zygiskDebugName }}
-          path: "./LSPosed-Irena-debug/*"
-
-      - name: Upload mappings
-        uses: actions/upload-artifact@v4
-        with:
-          name: mappings
           path: |
-            magisk-loader/build/outputs/mapping
-            app/build/outputs/mapping
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-irena200-gradle-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-irena200-gradle-
 
-      - name: Upload symbols
+      - name: Generate build signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/irena-build.jks" \
+            -storetype JKS \
+            -storepass android \
+            -keypass android \
+            -alias irena \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Irena Self Build" \
+            -noprompt
+
+          {
+            echo "androidStoreFile=$RUNNER_TEMP/irena-build.jks"
+            echo "androidStorePassword=android"
+            echo "androidKeyAlias=irena"
+            echo "androidKeyPassword=android"
+          } >> gradle.properties
+
+      - name: Configure build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x gradlew
+          mkdir -p "$HOME/.gradle"
+
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.caching=true
+          org.gradle.parallel=true
+          org.gradle.workers.max=2
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8
+          EOF
+
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+
+          java -version
+          cmake --version
+          ninja --version
+
+      - name: Build Irena modules
+        run: ./gradlew :magisk-loader:zipAll --no-daemon --stacktrace
+
+      - name: Prepare module artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          RELEASE_FILES=(magisk-loader/release/LSPosed-v2.0.0-*-Irena-release.zip)
+          DEBUG_FILES=(magisk-loader/release/LSPosed-v2.0.0-*-Irena-debug.zip)
+
+          if [ "${#RELEASE_FILES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Release ZIP"
+            exit 1
+          fi
+
+          if [ "${#DEBUG_FILES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Debug ZIP"
+            exit 1
+          fi
+
+          mkdir -p artifacts/release artifacts/debug
+
+          unzip -q "${RELEASE_FILES[0]}" -d artifacts/release
+          unzip -q "${DEBUG_FILES[0]}" -d artifacts/debug
+
+          sha256sum "${RELEASE_FILES[0]}" "${DEBUG_FILES[0]}"
+
+      - name: Upload Release module
         uses: actions/upload-artifact@v4
         with:
-          name: symbols
-          path: build/symbols
+          name: LSPosed-Irena-2.0.0-release
+          path: artifacts/release/
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload Debug module
+        uses: actions/upload-artifact@v4
+        with:
+          name: LSPosed-Irena-2.0.0-debug
+          path: artifacts/debug/
+          include-hidden-files: true
+          if-no-files-found: error
